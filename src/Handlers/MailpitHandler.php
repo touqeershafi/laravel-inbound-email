@@ -2,9 +2,12 @@
 
 namespace Touqeershafi\LaravelInboundEmail\Handlers;
 
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
 use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
 use Touqeershafi\LaravelInboundEmail\Contracts\InboundWebhookHandler;
@@ -38,9 +41,10 @@ class MailpitHandler implements InboundWebhookHandler
             throw new BadRequestHttpException('Mailpit webhook payload has no message ID.');
         }
 
-        $data = $this->fetchMessageFromApi($id, $request);
+        $api = $this->apiClient($request);
+        $data = $this->fetchMessageFromApi($api, $id);
 
-        return $this->buildMessage($data, $id);
+        return $this->buildMessage($data, $id, $api);
     }
 
     // -------------------------------------------------------------------------
@@ -55,22 +59,27 @@ class MailpitHandler implements InboundWebhookHandler
         return is_string($id) && $id !== '' ? $id : null;
     }
 
-    /**
-     * @return array<string, mixed>
-     */
-    private function fetchMessageFromApi(string $id, Request $request): array
+    private function apiClient(Request $request): PendingRequest
     {
         $settings = $this->inboundProviderSettings($request, 'mailpit');
         $base = rtrim((string) ($settings['base_url'] ?? 'http://127.0.0.1:8025'), '/');
         $token = $settings['api_token'] ?? null;
 
-        $pending = Http::baseUrl($base)
-            ->accept('application/json')
-            ->timeout(10);
+        $pending = Http::baseUrl($base)->timeout(10);
 
         if (is_string($token) && $token !== '') {
             $pending = $pending->withToken($token);
         }
+
+        return $pending;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function fetchMessageFromApi(PendingRequest $api, string $id): array
+    {
+        $pending = (clone $api)->accept('application/json');
 
         try {
             $response = $pending->get("/api/v1/message/{$id}");
@@ -91,7 +100,7 @@ class MailpitHandler implements InboundWebhookHandler
     /**
      * @param  array<string, mixed>  $data
      */
-    private function buildMessage(array $data, string $id): InboundMessage
+    private function buildMessage(array $data, string $id, PendingRequest $api): InboundMessage
     {
         return new InboundMessage(
             provider: 'mailpit',
@@ -103,7 +112,7 @@ class MailpitHandler implements InboundWebhookHandler
             subject: isset($data['Subject']) ? (string) $data['Subject'] : null,
             text: isset($data['Text']) ? (string) $data['Text'] : null,
             html: isset($data['HTML']) ? (string) $data['HTML'] : null,
-            attachments: $this->parseAttachments($data['Attachments'] ?? null),
+            attachments: $this->parseAttachments($data['Attachments'] ?? null, $id, $api),
             headers: $this->parseHeaders($data['Headers'] ?? null),
             metadata: ['mailpit_id' => $id],
         );
@@ -184,9 +193,12 @@ class MailpitHandler implements InboundWebhookHandler
     }
 
     /**
+     * Mailpit's message API lists attachment metadata (`PartID`, `FileName`, `ContentType`, `Size`) without the bytes;
+     * each part is downloaded from `/api/v1/message/{id}/part/{PartID}`. An inline `Content` value is used when present.
+     *
      * @return array<int, array{filename: string, content_type: ?string, content_base64: string}>
      */
-    private function parseAttachments(mixed $attachments): array
+    private function parseAttachments(mixed $attachments, string $messageId, PendingRequest $api): array
     {
         $out = [];
 
@@ -195,16 +207,42 @@ class MailpitHandler implements InboundWebhookHandler
                 continue;
             }
 
-            $content = $att['Content'] ?? '';
+            $filename = $att['FileName'] ?? $att['Filename'] ?? null;
+            $content = $att['Content'] ?? null;
+            $contentBase64 = is_string($content) && $content !== ''
+                ? $content
+                : $this->fetchPartBase64($api, $messageId, $att['PartID'] ?? null);
 
             $out[] = [
-                'filename' => isset($att['Filename']) ? (string) $att['Filename'] : 'attachment',
+                'filename' => is_string($filename) && $filename !== '' ? $filename : 'attachment',
                 'content_type' => isset($att['ContentType']) ? (string) $att['ContentType'] : null,
-                'content_base64' => is_string($content) ? $content : base64_encode((string) $content),
+                'content_base64' => $contentBase64,
             ];
         }
 
         return $out;
+    }
+
+    private function fetchPartBase64(PendingRequest $api, string $messageId, mixed $partId): string
+    {
+        if (! is_string($partId) || $partId === '') {
+            return '';
+        }
+
+        try {
+            $response = (clone $api)->get('/api/v1/message/'.rawurlencode($messageId).'/part/'.rawurlencode($partId));
+            $response->throw();
+        } catch (RequestException|ConnectionException $e) {
+            Log::warning('inbound_email.mailpit_attachment_fetch_failed', [
+                'mailpit_id' => $messageId,
+                'part_id' => $partId,
+                'error' => $e->getMessage(),
+            ]);
+
+            return '';
+        }
+
+        return base64_encode($response->body());
     }
 
     /**
