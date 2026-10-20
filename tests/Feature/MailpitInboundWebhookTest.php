@@ -95,4 +95,40 @@ class MailpitInboundWebhookTest extends TestCase
 
         Bus::assertDispatched(DefaultProcessInboundEmailJob::class);
     }
+
+    public function test_downloads_attachment_parts_from_the_api(): void
+    {
+        config(['inbound-email.providers.mailpit.webhook_secret' => '']);
+
+        Bus::fake();
+
+        Http::fake([
+            '127.0.0.1:8825/api/v1/message/mp-att/part/2' => Http::response('%PDF-bytes', 200),
+            '127.0.0.1:8825/api/v1/message/mp-att/part/3' => Http::response('', 500),
+            '127.0.0.1:8825/api/v1/message/mp-att' => Http::response([
+                'From' => ['Address' => 'from@local.test', 'Name' => 'From'],
+                'To' => [['Address' => 'to@local.test', 'Name' => 'To']],
+                'Subject' => 'With files',
+                'Text' => 'See attached',
+                'Attachments' => [
+                    ['PartID' => '2', 'FileName' => 'invoice.pdf', 'ContentType' => 'application/pdf', 'Size' => 10],
+                    ['PartID' => '3', 'FileName' => 'broken.png', 'ContentType' => 'image/png', 'Size' => 4],
+                ],
+                'Headers' => [],
+            ], 200),
+        ]);
+
+        $this->postJson('/webhooks/inbound/mailpit', ['ID' => 'mp-att'])->assertOk();
+
+        Bus::assertDispatched(DefaultProcessInboundEmailJob::class, function (DefaultProcessInboundEmailJob $job): bool {
+            $attachments = $job->message['attachments'] ?? [];
+
+            return count($attachments) === 2
+                && $attachments[0]['filename'] === 'invoice.pdf'
+                && $attachments[0]['content_type'] === 'application/pdf'
+                && base64_decode($attachments[0]['content_base64'], true) === '%PDF-bytes'
+                && $attachments[1]['filename'] === 'broken.png'
+                && $attachments[1]['content_base64'] === '';
+        });
+    }
 }
